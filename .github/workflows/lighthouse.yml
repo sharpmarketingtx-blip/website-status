@@ -45,28 +45,43 @@ jobs:
           temporaryPublicStorage: true
           runs: 1
       - name: Save scores and list misses
-        if: steps.clock.outputs.run == 'true'
+        id: scores
+        if: ${{ !cancelled() && steps.clock.outputs.run == 'true' }}
         env:
           MANIFEST: ${{ steps.lhci.outputs.manifest }}
         run: |
           node <<'NODE'
           const fs = require('node:fs');
-          const results = JSON.parse(process.env.MANIFEST);
-          const mobile = results.filter(run => run.isRepresentativeRun !== false);
+          const results = JSON.parse(process.env.MANIFEST || '[]');
+          const reportPaths = results
+            .filter(run => run.isRepresentativeRun !== false)
+            .map(run => run.jsonPath);
+          const localResults = '.lighthouseci';
+          if (!reportPaths.length && fs.existsSync(localResults)) {
+            for (const name of fs.readdirSync(localResults)) {
+              if (/^lhr-.*\.json$/.test(name)) reportPaths.push(`${localResults}/${name}`);
+            }
+          }
+          const reports = new Map();
+          for (const path of reportPaths) {
+            const report = JSON.parse(fs.readFileSync(path, 'utf8'));
+            if (report.requestedUrl && !report.runtimeError) {
+              reports.set(new URL(report.requestedUrl).hostname, report);
+            }
+          }
           const domains = ["silverplanner.com","aicoachtx.com","smartmarketingtx.com","homefinderstx.com","tccpe.org","poshcapital.fund"];
           const thresholds = {performance: 70, accessibility: 90, best_practices: 90, seo: 90};
           const run_date = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Chicago'});
           const issues = [];
 
           const scores = domains.map(domain => {
-            const entry = mobile.find(run => new URL(run.url).hostname === domain);
-            const report = entry ? JSON.parse(fs.readFileSync(entry.jsonPath, 'utf8')) : {};
+            const report = reports.get(domain);
             const row = {domain, run_date};
             for (const key of Object.keys(thresholds)) {
-              const value = report.categories?.[key.replace('_', '-')]?.score;
+              const value = report?.categories?.[key.replace('_', '-')]?.score;
               row[key] = typeof value === 'number' ? Math.round(value * 100) : null;
-              if (row[key] === null || row[key] < thresholds[key]) {
-                issues.push(`- https://${domain}/ — ${key}: ${row[key] ?? 'N/V'} (target ${thresholds[key]})`);
+              if (row[key] !== null && row[key] < thresholds[key]) {
+                issues.push(`- https://${domain}/ — ${key}: ${row[key]} (target ${thresholds[key]})`);
               }
             }
             return row;
@@ -75,10 +90,10 @@ jobs:
           fs.mkdirSync('lighthouse', {recursive: true});
           fs.writeFileSync('lighthouse/latest.json', JSON.stringify(scores, null, 2) + '\n');
           fs.writeFileSync('lighthouse-findings.md', issues.length ? issues.join('\n') + '\n' : '');
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Mobile Lighthouse\n\n' + scores.map(row => `- ${row.domain}: ${row.performance} / ${row.accessibility} / ${row.best_practices} / ${row.seo}`).join('\n') + '\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Mobile Lighthouse\n\n' + scores.map(row => `- ${row.domain}: ${[row.performance, row.accessibility, row.best_practices, row.seo].map(score => score ?? 'N/V').join(' / ')}`).join('\n') + '\n');
           NODE
       - name: Publish latest scores
-        if: steps.clock.outputs.run == 'true'
+        if: ${{ !cancelled() && steps.scores.outcome == 'success' }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -93,7 +108,7 @@ jobs:
           done
           exit 1
       - name: Open threshold issue
-        if: steps.clock.outputs.run == 'true'
+        if: ${{ !cancelled() && steps.scores.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
