@@ -1,0 +1,83 @@
+name: Uptime check
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: uptime-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check homepages and update outage issues
+        shell: bash
+        run: |
+          set -euo pipefail
+          domains=(silverplanner.com aicoachtx.com smartmarketingtx.com homefinderstx.com tccpe.org poshcapital.fund)
+          results=$(mktemp -d)
+          trap 'rm -rf "$results"' EXIT
+
+          request() {
+            local code
+            if code=$(curl --silent --show-error --location --max-time 20 \
+              --output /dev/null --write-out '%{http_code}' "$1"); then
+              printf '%s' "$code"
+            else
+              printf '000'
+            fi
+          }
+
+          probe() {
+            local domain=$1 first final checked_at
+            first=$(request "https://$domain/")
+            final=$first
+            if [[ "$first" != 200 ]]; then
+              sleep 30
+              final=$(request "https://$domain/")
+            fi
+            checked_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            printf '%s %s %s\n' "$first" "$final" "$checked_at" > "$results/$domain"
+          }
+
+          pids=()
+          for domain in "${domains[@]}"; do
+            probe "$domain" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+
+          open_issues=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq '.[] | select(has("pull_request") | not) | {title, number}')
+          printf '| Homepage | First status | Final status | Checked (UTC) | Issue action |\n| --- | ---: | ---: | --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
+          for domain in "${domains[@]}"; do
+            read -r first final checked_at < "$results/$domain"
+            title="DOWN: $domain"
+            issue_numbers=$(jq -r --arg title "$title" 'select(.title == $title) | .number' <<< "$open_issues")
+            action=none
+
+            if [[ "$final" == 200 && -n "$issue_numbers" ]]; then
+              while IFS= read -r number; do
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                  --comment "Recovered at $checked_at. https://$domain/ returned HTTP 200."
+              done <<< "$issue_numbers"
+              action=recovered
+            elif [[ "$final" != 200 && -z "$issue_numbers" ]]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label uptime \
+                --body "https://$domain/ returned status $final at $checked_at after retrying. Initial status: $first. Status 000 means the request did not complete."
+              action=opened
+            elif [[ "$final" != 200 ]]; then
+              action=already-open
+            fi
+            printf '| %s | %s | %s | %s | %s |\n' "$domain" "$first" "$final" "$checked_at" "$action" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s: first=%s final=%s checked=%s issue=%s\n' "$domain" "$first" "$final" "$checked_at" "$action"
+          done

@@ -6,17 +6,17 @@ on:
     - cron: '0 12 * * 1'
 
 permissions:
-  contents: write
-  issues: write
+  contents: read
 
 concurrency:
   group: lighthouse
   cancel-in-progress: false
 
 jobs:
-  audit:
+  clock:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    outputs:
+      run: ${{ steps.clock.outputs.run }}
     steps:
       - name: Select the Central time slot
         id: clock
@@ -28,72 +28,125 @@ jobs:
           if [[ "$TRIGGER" = workflow_dispatch || "$CRON:$offset" = '0 11 * * 1:-0500' || "$CRON:$offset" = '0 12 * * 1:-0600' ]]; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v7
-        if: steps.clock.outputs.run == 'true'
+
+  audit:
+    needs: clock
+    if: needs.clock.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        domain: [silverplanner.com, aicoachtx.com, smartmarketingtx.com, homefinderstx.com, tccpe.org, poshcapital.fund]
+    steps:
+      - name: Start a virtual display for Chrome
+        run: |
+          Xvfb :99 -screen 0 1280x960x24 -nolisten tcp > "$RUNNER_TEMP/lighthouse-display.log" 2>&1 &
+          for attempt in {1..10}; do
+            if xdpyinfo -display :99 >/dev/null 2>&1; then
+              echo 'DISPLAY=:99' >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/lighthouse-display.log"
+          exit 1
+      - name: Configure mobile Lighthouse
+        run: |
+          cat > /tmp/lighthouse-ci.json <<'JSON'
+          {"ci":{"collect":{"headful":true,"settings":{"formFactor":"mobile","maxWaitForFcp":60000,"maxWaitForLoad":90000,"onlyCategories":["performance","accessibility","best-practices","seo"]}}}}
+          JSON
       - uses: treosh/lighthouse-ci-action@v12
-        if: steps.clock.outputs.run == 'true'
         id: lhci
+        continue-on-error: true
+        timeout-minutes: 7
         with:
-          urls: |
-            https://silverplanner.com/
-            https://aicoachtx.com/
-            https://smartmarketingtx.com/
-            https://homefinderstx.com/
-            https://tccpe.org/
-            https://poshcapital.fund/
+          urls: https://${{ matrix.domain }}/
+          configPath: /tmp/lighthouse-ci.json
           uploadArtifacts: true
+          artifactName: lighthouse-report-${{ matrix.domain }}
           temporaryPublicStorage: true
           runs: 1
-      - name: Save scores and list misses
-        id: scores
-        if: ${{ !cancelled() && steps.clock.outputs.run == 'true' }}
+      - name: Keep the score or record the collection error
+        if: ${{ !cancelled() }}
         env:
+          DOMAIN: ${{ matrix.domain }}
           MANIFEST: ${{ steps.lhci.outputs.manifest }}
+          ACTION_OUTCOME: ${{ steps.lhci.outcome }}
         run: |
           node <<'NODE'
           const fs = require('node:fs');
-          const results = JSON.parse(process.env.MANIFEST || '[]');
-          const reportPaths = results
-            .filter(run => run.isRepresentativeRun !== false)
-            .map(run => run.jsonPath);
-          const localResults = '.lighthouseci';
-          if (!reportPaths.length && fs.existsSync(localResults)) {
-            for (const name of fs.readdirSync(localResults)) {
-              if (/^lhr-.*\.json$/.test(name)) reportPaths.push(`${localResults}/${name}`);
-            }
+          const domain = process.env.DOMAIN;
+          const manifest = JSON.parse(process.env.MANIFEST || '[]');
+          const entry = manifest.find(run => run.isRepresentativeRun !== false);
+          const scoresDirectory = '.lighthouseci';
+          const fallback = fs.existsSync(scoresDirectory)
+            ? fs.readdirSync(scoresDirectory).find(name => /^lhr-.*\.json$/.test(name))
+            : undefined;
+          const reportPath = entry?.jsonPath || (fallback && scoresDirectory + '/' + fallback);
+          const report = reportPath ? JSON.parse(fs.readFileSync(reportPath, 'utf8')) : null;
+          const row = {domain, run_date: new Date().toLocaleDateString('en-CA', {timeZone: 'America/Chicago'})};
+          for (const name of ['performance', 'accessibility', 'best_practices', 'seo']) {
+            const value = report?.categories?.[name.replace('_', '-')]?.score;
+            row[name] = !report?.runtimeError && typeof value === 'number' ? Math.round(value * 100) : null;
           }
-          const reports = new Map();
-          for (const path of reportPaths) {
-            const report = JSON.parse(fs.readFileSync(path, 'utf8'));
-            if (report.requestedUrl && !report.runtimeError) {
-              reports.set(new URL(report.requestedUrl).hostname, report);
-            }
-          }
-          const domains = ["silverplanner.com","aicoachtx.com","smartmarketingtx.com","homefinderstx.com","tccpe.org","poshcapital.fund"];
-          const thresholds = {performance: 70, accessibility: 90, best_practices: 90, seo: 90};
-          const run_date = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Chicago'});
-          const issues = [];
+          const error = report?.runtimeError?.code || (!report ? 'Lighthouse collection ' + process.env.ACTION_OUTCOME : null);
+          fs.writeFileSync('score-' + domain + '.json', JSON.stringify({row, error}) + '\n');
+          NODE
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: lighthouse-score-${{ matrix.domain }}
+          path: score-${{ matrix.domain }}.json
+          if-no-files-found: error
 
-          const scores = domains.map(domain => {
-            const report = reports.get(domain);
-            const row = {domain, run_date};
-            for (const key of Object.keys(thresholds)) {
-              const value = report?.categories?.[key.replace('_', '-')]?.score;
-              row[key] = typeof value === 'number' ? Math.round(value * 100) : null;
-              if (row[key] !== null && row[key] < thresholds[key]) {
-                issues.push(`- https://${domain}/ — ${key}: ${row[key]} (target ${thresholds[key]})`);
+  publish:
+    needs: [clock, audit]
+    if: ${{ !cancelled() && needs.clock.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: lighthouse-score-*
+          merge-multiple: true
+          path: /tmp/lighthouse-scores
+      - name: Save latest scores and summarize results
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const domains = ['silverplanner.com', 'aicoachtx.com', 'smartmarketingtx.com', 'homefinderstx.com', 'tccpe.org', 'poshcapital.fund'];
+          const targets = {performance: 70, accessibility: 90, best_practices: 90, seo: 90};
+          const run_date = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Chicago'});
+          const failures = [];
+          const belowTarget = [];
+          const summary = ['| Domain | Performance | Accessibility | Best practices | SEO | Collection |','| --- | ---: | ---: | ---: | ---: | --- |'];
+          const results = domains.map(domain => {
+            const file = '/tmp/lighthouse-scores/score-' + domain + '.json';
+            const result = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+            const row = {domain, run_date: result.row?.run_date || run_date};
+            for (const [key, target] of Object.entries(targets)) {
+              row[key] = result.row?.[key] ?? null;
+              if (row[key] !== null && row[key] < target) {
+                belowTarget.push('- https://' + domain + '/ ' + key + ': ' + row[key] + ' (target ' + target + ')');
               }
             }
+            const incomplete = Object.keys(targets).some(key => row[key] === null);
+            const state = incomplete ? result.error || 'Missing scores' : 'Complete';
+            if (incomplete) failures.push(domain + ': ' + state);
+            summary.push('| ' + domain + ' | ' + Object.keys(targets).map(key => row[key] ?? 'N/V').join(' | ') + ' | ' + state + ' |');
             return row;
           });
-
           fs.mkdirSync('lighthouse', {recursive: true});
-          fs.writeFileSync('lighthouse/latest.json', JSON.stringify(scores, null, 2) + '\n');
-          fs.writeFileSync('lighthouse-findings.md', issues.length ? issues.join('\n') + '\n' : '');
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Mobile Lighthouse\n\n' + scores.map(row => `- ${row.domain}: ${[row.performance, row.accessibility, row.best_practices, row.seo].map(score => score ?? 'N/V').join(' / ')}`).join('\n') + '\n');
+          fs.writeFileSync('lighthouse/latest.json', JSON.stringify(results, null, 2) + '\n');
+          fs.writeFileSync('lighthouse-findings.md', belowTarget.length ? belowTarget.join('\n') + '\n' : '');
+          fs.writeFileSync('lighthouse-errors.txt', failures.length ? failures.join('\n') + '\n' : '');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.join('\n') + '\n');
           NODE
-      - name: Publish latest scores
-        if: ${{ !cancelled() && steps.scores.outcome == 'success' }}
+      - name: Commit latest scores
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -107,13 +160,21 @@ jobs:
             sleep "$attempt"
           done
           exit 1
-      - name: Open threshold issue
-        if: ${{ !cancelled() && steps.scores.outcome == 'success' }}
+      - name: Report scores below target
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ -s lighthouse-findings.md ]]; then
-            if [[ -z "$(gh issue list --state open --search '"Lighthouse below target" in:title' --json title --jq '.[] | select(.title == "Lighthouse below target") | .title')" ]]; then
-              gh issue create --title "Lighthouse below target" --body-file lighthouse-findings.md
+            number=$(gh issue list --state open --search '"Lighthouse below target" in:title' --json number,title --jq '.[] | select(.title == "Lighthouse below target") | .number' | head -n 1)
+            if [[ -n "$number" ]]; then
+              gh issue comment "$number" --body-file lighthouse-findings.md
+            else
+              gh issue create --title 'Lighthouse below target' --body-file lighthouse-findings.md
             fi
+          fi
+      - name: Flag incomplete audits
+        run: |
+          if [[ -s lighthouse-errors.txt ]]; then
+            cat lighthouse-errors.txt
+            exit 1
           fi
