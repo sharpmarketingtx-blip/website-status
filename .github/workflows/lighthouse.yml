@@ -43,7 +43,7 @@ jobs:
         run: |
           Xvfb :99 -screen 0 1280x960x24 -nolisten tcp > "$RUNNER_TEMP/lighthouse-display.log" 2>&1 &
           for attempt in {1..10}; do
-            if xdpyinfo -display :99 >/dev/null 2>&1; then
+            if [[ -S /tmp/.X11-unix/X99 ]]; then
               echo 'DISPLAY=:99' >> "$GITHUB_ENV"
               exit 0
             fi
