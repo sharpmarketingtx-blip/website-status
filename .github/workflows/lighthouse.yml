@@ -1,0 +1,104 @@
+name: Lighthouse CI
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 11 * * 1'
+    - cron: '0 12 * * 1'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: lighthouse
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Select the Central time slot
+        id: clock
+        env:
+          TRIGGER: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+        run: |
+          offset=$(TZ=America/Chicago date +%z)
+          if [[ "$TRIGGER" = workflow_dispatch || "$CRON:$offset" = '0 11 * * 1:-0500' || "$CRON:$offset" = '0 12 * * 1:-0600' ]]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.clock.outputs.run == 'true'
+      - uses: treosh/lighthouse-ci-action@v12
+        if: steps.clock.outputs.run == 'true'
+        id: lhci
+        with:
+          urls: |
+            https://silverplanner.com/
+            https://aicoachtx.com/
+            https://smartmarketingtx.com/
+            https://homefinderstx.com/
+            https://tccpe.org/
+            https://poshcapital.fund/
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+          runs: 1
+      - name: Save scores and list misses
+        if: steps.clock.outputs.run == 'true'
+        env:
+          MANIFEST: ${{ steps.lhci.outputs.manifest }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const results = JSON.parse(process.env.MANIFEST);
+          const mobile = results.filter(run => run.isRepresentativeRun !== false);
+          const domains = ["silverplanner.com","aicoachtx.com","smartmarketingtx.com","homefinderstx.com","tccpe.org","poshcapital.fund"];
+          const thresholds = {performance: 70, accessibility: 90, best_practices: 90, seo: 90};
+          const run_date = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Chicago'});
+          const issues = [];
+
+          const scores = domains.map(domain => {
+            const entry = mobile.find(run => new URL(run.url).hostname === domain);
+            const report = entry ? JSON.parse(fs.readFileSync(entry.jsonPath, 'utf8')) : {};
+            const row = {domain, run_date};
+            for (const key of Object.keys(thresholds)) {
+              const value = report.categories?.[key.replace('_', '-')]?.score;
+              row[key] = typeof value === 'number' ? Math.round(value * 100) : null;
+              if (row[key] === null || row[key] < thresholds[key]) {
+                issues.push(`- https://${domain}/ — ${key}: ${row[key] ?? 'N/V'} (target ${thresholds[key]})`);
+              }
+            }
+            return row;
+          });
+
+          fs.mkdirSync('lighthouse', {recursive: true});
+          fs.writeFileSync('lighthouse/latest.json', JSON.stringify(scores, null, 2) + '\n');
+          fs.writeFileSync('lighthouse-findings.md', issues.length ? issues.join('\n') + '\n' : '');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Mobile Lighthouse\n\n' + scores.map(row => `- ${row.domain}: ${row.performance} / ${row.accessibility} / ${row.best_practices} / ${row.seo}`).join('\n') + '\n');
+          NODE
+      - name: Publish latest scores
+        if: steps.clock.outputs.run == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add lighthouse/latest.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'Update weekly Lighthouse scores'
+          branch="$GITHUB_REF_NAME"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$branch"
+            if git push origin "HEAD:$branch"; then exit 0; fi
+            sleep "$attempt"
+          done
+          exit 1
+      - name: Open threshold issue
+        if: steps.clock.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -s lighthouse-findings.md ]]; then
+            if [[ -z "$(gh issue list --state open --search '"Lighthouse below target" in:title' --json title --jq '.[] | select(.title == "Lighthouse below target") | .title')" ]]; then
+              gh issue create --title "Lighthouse below target" --body-file lighthouse-findings.md
+            fi
+          fi

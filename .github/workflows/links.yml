@@ -1,0 +1,109 @@
+name: Sitemap link check
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 6 * * 1'
+      timezone: America/Chicago
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sitemap-links
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Collect every sitemap URL
+        run: |
+          python3 <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from collections import deque
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlparse
+          import gzip
+          import xml.etree.ElementTree as ET
+
+          domains = ["silverplanner.com","aicoachtx.com","smartmarketingtx.com","homefinderstx.com","tccpe.org","poshcapital.fund"]
+          allowed = {name for domain in domains for name in (domain, 'www.' + domain)}
+          pending = deque(f'https://{d}/sitemap.xml' for d in domains)
+          seen = set()
+          pages = set()
+          failures = []
+
+          while pending:
+              url = pending.popleft()
+              if url in seen:
+                  continue
+              seen.add(url)
+              try:
+                  if urlparse(url).scheme != 'https' or urlparse(url).hostname not in allowed:
+                      raise ValueError('sitemap URL outside the monitored sites')
+                  request = Request(url, headers={'User-Agent': 'WebsiteStatusSitemap/1.0'})
+                  with urlopen(request, timeout=25) as response:
+                      if urlparse(response.url).hostname not in allowed:
+                          raise ValueError('sitemap redirects off site')
+                      content = response.read()
+                  if content.startswith(b'\x1f\x8b'):
+                      content = gzip.decompress(content)
+                  root = ET.fromstring(content)
+                  kind = root.tag.rsplit('}', 1)[-1]
+                  if kind not in {'sitemapindex', 'urlset'}:
+                      raise ValueError(f'unexpected root {kind}')
+                  for loc in root.findall('./{*}sitemap/{*}loc' if kind == 'sitemapindex' else './{*}url/{*}loc'):
+                      link = (loc.text or '').strip()
+                      if urlparse(link).scheme not in {'http', 'https'} or not urlparse(link).hostname:
+                          failures.append(f'- {url}: invalid loc {link!r}')
+                      elif kind == 'sitemapindex':
+                          pending.append(link)
+                      else:
+                          pages.add(link)
+              except (OSError, ValueError, ET.ParseError) as problem:
+                  failures.append(f'- {url}: {problem}')
+
+          with open('sitemap-urls.txt', 'w', encoding='utf-8') as target:
+              target.write(''.join(url + '\n' for url in sorted(pages)))
+          with open('sitemap-findings.md', 'w', encoding='utf-8') as target:
+              target.write(''.join(problem + '\n' for problem in failures))
+          print(f'{len(seen)} sitemap files attempted, {len(pages)} unique page URLs, {len(failures)} sitemap problems')
+          PY
+      - name: Check sitemap links
+        id: lychee
+        if: hashFiles('sitemap-urls.txt') != ''
+        uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          args: --no-progress --max-concurrency 8 --max-retries 2 --timeout 20 sitemap-urls.txt
+          format: markdown
+          output: lychee-report.md
+          fail: false
+      - name: Save full scan evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sitemap-link-report
+          path: |
+            lychee-report.md
+            sitemap-findings.md
+            sitemap-urls.txt
+      - name: Report failures
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_EXIT: ${{ steps.lychee.outputs.exit_code }}
+        run: |
+          if [[ -s lychee-report.md ]]; then cat lychee-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [[ -s sitemap-findings.md ]]; then cat sitemap-findings.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [[ -s sitemap-findings.md || "$SCAN_EXIT" != 0 ]]; then
+            {
+              printf 'Full evidence: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+              cat sitemap-findings.md
+              if [[ -s lychee-report.md ]]; then head -c 55000 lychee-report.md; fi
+            } > link-findings.md
+            if [[ -z "$(gh issue list --state open --search '"Broken links found" in:title' --json title --jq '.[] | select(.title == "Broken links found") | .title')" ]]; then
+              gh issue create --title "Broken links found" --body-file link-findings.md
+            fi
+          fi

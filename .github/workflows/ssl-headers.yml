@@ -1,0 +1,67 @@
+name: SSL and security headers
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1'
+      timezone: America/Chicago
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ssl-headers
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check certificate expiry and response headers
+        run: |
+          set -euo pipefail
+          : > ssl-findings.md
+          echo '| Domain | Certificate days left | HSTS | X-Content-Type-Options | Referrer-Policy |' >> "$GITHUB_STEP_SUMMARY"
+          echo '| --- | ---: | --- | --- | --- |' >> "$GITHUB_STEP_SUMMARY"
+          for domain in silverplanner.com aicoachtx.com smartmarketingtx.com homefinderstx.com tccpe.org poshcapital.fund; do
+            days=N/V
+            if expiry=$(timeout 20 openssl s_client -connect "$domain:443" -servername "$domain" -verify_hostname "$domain" -verify_return_error </dev/null 2>/dev/null | openssl x509 -noout -enddate); then
+              expires=$(date --date="${expiry#notAfter=}" +%s)
+              now=$(date +%s)
+              days=$(( (expires - now) / 86400 ))
+              if (( days < 21 )); then printf -- '- %s certificate: %s days left\n' "$domain" "$days" >> ssl-findings.md; fi
+            else
+              printf -- '- %s: certificate could not be verified\n' "$domain" >> ssl-findings.md
+            fi
+
+            hsts=N/V
+            nosniff=N/V
+            referrer=N/V
+            if curl --proto '=https' --proto-redir '=https' --silent --show-error --location --fail --head --max-time 25 "https://$domain/" > response.headers; then
+              awk '/^HTTP\// { block="" } { block=block $0 "\n" } END { printf "%s", block }' response.headers > final.headers
+              for pair in 'hsts:Strict-Transport-Security' 'nosniff:X-Content-Type-Options' 'referrer:Referrer-Policy'; do
+                name=${pair%:*}
+                header=${pair#*:}
+                if grep -qiE "^${header}:[[:space:]]*[^[:space:]]" final.headers; then
+                  printf -v "$name" 'present'
+                else
+                  printf -v "$name" 'missing'
+                  printf -- '- %s missing %s\n' "$domain" "$header" >> ssl-findings.md
+                fi
+              done
+            else
+              printf -- '- %s: homepage headers could not be checked\n' "$domain" >> ssl-findings.md
+            fi
+            printf '| %s | %s | %s | %s | %s |\n' "$domain" "$days" "$hsts" "$nosniff" "$referrer" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Open issue for SSL or header problems
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -s ssl-findings.md ]]; then
+            if [[ -z "$(gh issue list --state open --search '"SSL or security header problem" in:title' --json title --jq '.[] | select(.title == "SSL or security header problem") | .title')" ]]; then
+              gh issue create --title "SSL or security header problem" --body-file ssl-findings.md
+            fi
+          fi
