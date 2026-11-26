@@ -1,9 +1,6 @@
 name: Lighthouse CI
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 11 * * 1'
-    - cron: '0 12 * * 1'
 
 permissions:
   contents: read
@@ -13,25 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  clock:
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.clock.outputs.run }}
-    steps:
-      - name: Select the Central time slot
-        id: clock
-        env:
-          TRIGGER: ${{ github.event_name }}
-          CRON: ${{ github.event.schedule }}
-        run: |
-          offset=$(TZ=America/Chicago date +%z)
-          if [[ "$TRIGGER" = workflow_dispatch || "$CRON:$offset" = '0 11 * * 1:-0500' || "$CRON:$offset" = '0 12 * * 1:-0600' ]]; then
-            echo 'run=true' >> "$GITHUB_OUTPUT"
-          fi
-
   audit:
-    needs: clock
-    if: needs.clock.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -101,8 +80,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [clock, audit]
-    if: ${{ !cancelled() && needs.clock.outputs.run == 'true' }}
+    needs: audit
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
