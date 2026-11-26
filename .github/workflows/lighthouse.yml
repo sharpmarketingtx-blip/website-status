@@ -54,7 +54,7 @@ jobs:
       - name: Configure mobile Lighthouse
         run: |
           cat > /tmp/lighthouse-ci.json <<'JSON'
-          {"ci":{"collect":{"headful":true,"settings":{"formFactor":"mobile","maxWaitForFcp":60000,"maxWaitForLoad":90000,"onlyCategories":["performance","accessibility","best-practices","seo"]}}}}
+          {"ci":{"collect":{"headful":true,"settings":{"formFactor":"mobile","maxWaitForFcp":60000,"maxWaitForLoad":90000,"onlyCategories":["performance","accessibility","best-practices","seo"],"emulatedUserAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36","chromeFlags":"--user-agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36'"}}}}
           JSON
       - uses: treosh/lighthouse-ci-action@v12
         id: lhci
